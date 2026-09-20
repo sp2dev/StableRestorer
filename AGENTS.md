@@ -257,10 +257,10 @@ realm : {id} Colors_Slash - ...             ← metadata 里有下划线
 
 ```powershell
 # 构建
-dotnet build StableRestorer/StableRestorer.csproj -c Release
+dotnet build StableRestorer.csproj -c Release
 
 # 发布自包含单文件 exe（目标机器无需 .NET）
-dotnet publish StableRestorer/StableRestorer.csproj -c Release -r win-x64 -o dist
+dotnet publish StableRestorer.csproj -c Release -r win-x64
 ```
 
 - 发布前先确认没有残留的 `stablerestorer.exe` 进程在运行，否则 exe 被占用，
