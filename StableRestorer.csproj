@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>StableRestorer</RootNamespace>
+    <AssemblyName>stablerestorer</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <CETCompat>false</CETCompat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Realm" Version="20.1.0" />
+  </ItemGroup>
+
+  <!--
+    Packaging: `dotnet publish -c Release -r win-x64` produces a single self-contained
+    stablerestorer.exe that needs no .NET installation.
+
+    Trimming is deliberately NOT enabled: Realm discovers model types and marshals native
+    interop, which the trimmer cannot see, and a broken model set would surface as a confusing
+    Realm schema error at runtime rather than a build error.
+  -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <None Include="README.md" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
