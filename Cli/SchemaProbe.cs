@@ -3,8 +3,7 @@ using StableRestorer.Lazer;
 namespace StableRestorer.Cli;
 
 /// <summary>
-/// Diagnostics for "Realm will not open this database": probes candidate schema versions and
-/// reports exactly which declared properties do not match the file.
+/// 排查"Realm 打不开这个数据库"：逐个候选版本尝试，并报告到底哪条声明与文件不一致。
 /// </summary>
 public static class SchemaProbe
 {
@@ -13,14 +12,13 @@ public static class SchemaProbe
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
             Console.WriteLine("""
-                Lazerschema probe - find the Realm schema version of an osu!lazer client.realm.
+                探测 osu!lazer 的 client.realm 使用哪个 Realm 结构版本。
 
-                USAGE
-                  stablerestorer schemas --lazer <dir> [--schema-version <n>]
+                用法
+                  stablerestorer schemas --lazer <目录> [--schema-version <n>]
 
-                Without --schema-version every known candidate is tried, and the full mismatch
-                report is printed for each rejection. This is the tool to reach for after
-                updating osu!lazer: the errors name the properties that changed.
+                不给 --schema-version 时会依次尝试所有已知版本，并把每个被拒绝版本的
+                具体差异打出来。升级 osu!lazer 之后就用它定位改动过的字段。
                 """);
             return args.Length == 0 ? 1 : 0;
         }
@@ -37,8 +35,8 @@ public static class SchemaProbe
 
         int[] candidates = only is { } single ? new[] { single } : BuildCandidates();
 
-        Console.WriteLine($"client.realm : {Path.Combine(lazerDir, "client.realm")}");
-        Console.WriteLine($"compiled for : schema {LazerDatabase.SupportedSchemaVersion}");
+        Console.WriteLine($"client.realm ：{Path.Combine(lazerDir, "client.realm")}");
+        Console.WriteLine($"本程序编译于 ：结构版本 {LazerDatabase.SupportedSchemaVersion}");
         Console.WriteLine();
 
         foreach (int candidate in candidates)
@@ -47,15 +45,16 @@ public static class SchemaProbe
             {
                 var snapshot = LazerDatabase.Read(lazerDir, candidate);
 
-                Console.WriteLine($"v{candidate}: MATCH");
-                Console.WriteLine($"  beatmap sets : {snapshot.SongSets.Count}");
-                Console.WriteLine($"  named files  : {snapshot.TotalNamedFiles}");
-                Console.WriteLine($"  distinct hash: {snapshot.DistinctHashes}");
+                Console.WriteLine($"v{candidate}：匹配成功");
+                Console.WriteLine($"  谱面集     ：{snapshot.SongSets.Count}");
+                Console.WriteLine($"  带名文件   ：{snapshot.TotalNamedFiles}");
+                Console.WriteLine($"  皮肤 / 回放：{snapshot.Skins.Count} / {snapshot.Replays.Count}");
+                Console.WriteLine($"  不同哈希   ：{snapshot.DistinctHashes}");
                 return 0;
             }
             catch (LazerSchemaMismatchException ex)
             {
-                Console.WriteLine($"v{candidate}: rejected");
+                Console.WriteLine($"v{candidate}：不匹配");
                 Console.WriteLine(Indent(ex.Message));
             }
         }
@@ -81,7 +80,7 @@ public static class SchemaProbe
                 return args[i + 1];
         }
 
-        throw new CommandLineException("missing required option '--lazer'.");
+        throw new CommandLineException("缺少必需参数 --lazer。");
     }
 
     private static string Indent(string text)

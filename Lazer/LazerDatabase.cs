@@ -42,6 +42,36 @@ public sealed record SongSnapshot(
     IReadOnlyList<FileEntry> Files,
     bool Protected);
 
+/// <summary>
+/// A skin, ready to be written into <c>Skins/&lt;name&gt;/</c>.
+/// </summary>
+/// <param name="Name">Display name; also the folder name stable uses.</param>
+/// <param name="Creator">Informational only, shown in reports.</param>
+public sealed record SkinSnapshot(
+    Guid Id,
+    string Name,
+    string Creator,
+    IReadOnlyList<FileEntry> Files,
+    bool Protected);
+
+/// <summary>
+/// A local score whose replay can be written as an <c>.osr</c> into stable's <c>Replays/</c>.
+/// </summary>
+/// <param name="BeatmapHash">
+/// <c>ScoreInfo.BeatmapHash</c> - the MD5 of the difficulty this score was set on. Scores without
+/// beatmap metadata are dropped before this stage, so a name can always be built.
+/// </param>
+public sealed record ReplaySnapshot(
+    Guid Id,
+    string PlayerName,
+    string Artist,
+    string Title,
+    string DifficultyName,
+    string RulesetShortName,
+    DateTimeOffset Date,
+    string BeatmapHash,
+    FileEntry ReplayFile);
+
 /// <summary>Immutable, thread-safe copy of everything read out of the Realm database.</summary>
 public sealed record LazerSnapshot(
     int SchemaVersion,
@@ -54,7 +84,12 @@ public sealed record LazerSnapshot(
     int DistinctSetIds,
     int DistinctMapIds,
     int DuplicateSetIds,
-    IReadOnlyList<int> DuplicateSetIdList);
+    IReadOnlyList<int> DuplicateSetIdList,
+    IReadOnlyList<SkinSnapshot> Skins,
+    int ProtectedSkinCount,
+    IReadOnlyList<ReplaySnapshot> Replays,
+    int ScoresWithoutReplay,
+    int ScoresWithoutBeatmap);
 
 public sealed class LazerSchemaMismatchException : Exception
 {
@@ -131,6 +166,14 @@ public static class LazerDatabase
     /// <param name="schemaVersion">Schema version to declare; must equal the version inside the file.</param>
     public static LazerSnapshot Read(string dataDirectory, int schemaVersion)
     {
+        using var realm = Open(dataDirectory, schemaVersion);
+
+        return Project(realm, schemaVersion);
+    }
+
+    /// <summary>Opens the database strictly read-only. The caller owns the returned instance.</summary>
+    public static Realm Open(string dataDirectory, int schemaVersion)
+    {
         string dbPath = Path.Combine(dataDirectory, "client.realm");
 
         var config = new RealmConfiguration(dbPath)
@@ -140,29 +183,93 @@ public static class LazerDatabase
             Schema = SchemaTypes,
         };
 
-        Realm realm;
         try
         {
-            realm = Realm.GetInstance(config);
+            return Realm.GetInstance(config);
         }
         catch (RealmException ex)
         {
             throw new LazerSchemaMismatchException(ex.Message, ex);
         }
+    }
 
-        try
+    /// <summary>Read-only survey of the skin and score data, used to build the migration paths.</summary>
+    public sealed record ProbeResult(
+        int SkinCount,
+        int ProtectedSkinCount,
+        int SkinsWithFiles,
+        IReadOnlyList<string> SkinLines,
+        int ScoreCount,
+        int ScoresWithFiles,
+        int ScoresWithBeatmap,
+        int ScoresMissingBeatmap,
+        int DistinctReplayHashes,
+        IReadOnlyList<string> ScoreLines,
+        IReadOnlyList<string> RulesetShortNames);
+
+    public static ProbeResult Probe(string dataDirectory, int schemaVersion)
+    {
+        using var realm = Open(dataDirectory, schemaVersion);
+
+        var skins = realm.All<Skin>().ToList();
+        var skinLines = new List<string>();
+
+        foreach (var skin in skins)
         {
-            return Project(realm, schemaVersion);
+            int withName = skin.Files.Count(f => !string.IsNullOrWhiteSpace(f.Filename));
+            skinLines.Add($"'{skin.Name}' 作者='{skin.Creator}' 文件={skin.Files.Count} 有名={withName} " +
+                          $"内置={skin.Protected} 待删={skin.DeletePending}");
         }
-        finally
+
+        var scores = realm.All<Score>().ToList();
+        var scoreLines = new List<string>();
+        var rulesets = new HashSet<string>(StringComparer.Ordinal);
+        var hashes = new HashSet<string>(StringComparer.Ordinal);
+        int withFiles = 0, withBeatmap = 0, missingBeatmap = 0;
+
+        foreach (var score in scores)
         {
-            realm.Dispose();
+            string replayHash = score.Files.FirstOrDefault()?.File?.Hash ?? string.Empty;
+
+            if (replayHash.Length > 0)
+            {
+                withFiles++;
+                hashes.Add(replayHash);
+            }
+
+            if (score.BeatmapInfo?.Metadata != null)
+                withBeatmap++;
+            else
+                missingBeatmap++;
+
+            if (score.Ruleset?.ShortName is { Length: > 0 } shortName)
+                rulesets.Add(shortName);
+
+            if (scoreLines.Count < 10)
+            {
+                scoreLines.Add($"玩家='{score.RealmUser?.Username}' 规则='{score.Ruleset?.ShortName}' " +
+                               $"日期={score.Date:yyyy-MM-dd} 难度='{score.BeatmapInfo?.DifficultyName}' " +
+                               $"artist='{score.BeatmapInfo?.Metadata?.Artist}' title='{score.BeatmapInfo?.Metadata?.Title}' " +
+                               $"文件={score.Files.Count} 哈希={replayHash[..Math.Min(12, replayHash.Length)]}");
+            }
         }
+
+        return new ProbeResult(
+            skins.Count,
+            skins.Count(s => s.Protected),
+            skins.Count(s => s.Files.Count > 0),
+            skinLines,
+            scores.Count,
+            withFiles,
+            withBeatmap,
+            missingBeatmap,
+            hashes.Count,
+            scoreLines,
+            rulesets.OrderBy(r => r).ToList());
     }
 
     private static LazerSnapshot Project(Realm realm, int schemaVersion)
-    {
-        var sets = new List<SongSnapshot>();
+    {        var sets = new List<SongSnapshot>();
         int deleted = 0;
         int empty = 0;
         int protectedSets = 0;
@@ -261,7 +368,103 @@ public static class LazerDatabase
             ? a.SetId.CompareTo(b.SetId)
             : string.CompareOrdinal(a.Artist, b.Artist));
 
+        var skins = ProjectSkins(realm, out int protectedSkins);
+        var replays = ProjectReplays(realm, out int scoresWithoutReplay, out int scoresWithoutBeatmap);
+
         return new LazerSnapshot(schemaVersion, sets, deleted, empty, protectedSets, totalNamedFiles,
-            hashes.Count, setIdsSeen.Count, mapIdsSeen.Count, duplicateIds.Length, duplicateIds);
+            hashes.Count, setIdsSeen.Count, mapIdsSeen.Count, duplicateIds.Length, duplicateIds,
+            skins, protectedSkins, replays, scoresWithoutReplay, scoresWithoutBeatmap);
+    }
+
+    /// <summary>
+    /// Projects the user's skins. osu!lazer ships several protected skins that carry no files of
+    /// their own (they are code-defined), so those can never become a stable folder.
+    /// </summary>
+    private static IReadOnlyList<SkinSnapshot> ProjectSkins(Realm realm, out int protectedCount)
+    {
+        var skins = new List<SkinSnapshot>();
+        protectedCount = 0;
+
+        foreach (var skin in realm.All<Skin>())
+        {
+            if (skin.Protected)
+                protectedCount++;
+
+            if (skin.DeletePending)
+                continue;
+
+            var files = new List<FileEntry>(skin.Files.Count);
+
+            foreach (var usage in skin.Files)
+            {
+                string? hash = usage.File?.Hash;
+
+                if (string.IsNullOrWhiteSpace(hash) || string.IsNullOrWhiteSpace(usage.Filename))
+                    continue;
+
+                files.Add(new FileEntry(hash, usage.Filename));
+            }
+
+            if (files.Count == 0)
+                continue;
+
+            skins.Add(new SkinSnapshot(skin.ID, skin.Name ?? string.Empty, skin.Creator ?? string.Empty, files, skin.Protected));
+        }
+
+        skins.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+
+        return skins;
+    }
+
+    /// <summary>
+    /// Projects the local scores that have a replay file. Scores whose beatmap is no longer present
+    /// are dropped: stable's replay filename is built from the beatmap's artist/title/difficulty, so
+    /// without that metadata there is no sensible name to give the file.
+    /// </summary>
+    private static IReadOnlyList<ReplaySnapshot> ProjectReplays(Realm realm, out int withoutReplay, out int withoutBeatmap)
+    {
+        var replays = new List<ReplaySnapshot>();
+        withoutReplay = 0;
+        withoutBeatmap = 0;
+
+        foreach (var score in realm.All<Score>())
+        {
+            if (score.DeletePending)
+                continue;
+
+            var usage = score.Files.FirstOrDefault();
+            string? hash = usage?.File?.Hash;
+
+            if (string.IsNullOrWhiteSpace(hash))
+            {
+                withoutReplay++;
+                continue;
+            }
+
+            var metadata = score.BeatmapInfo?.Metadata;
+
+            if (metadata == null)
+            {
+                withoutBeatmap++;
+                continue;
+            }
+
+            string ruleset = score.Ruleset?.ShortName ?? string.Empty;
+
+            replays.Add(new ReplaySnapshot(
+                score.ID,
+                score.RealmUser?.Username ?? "unknown",
+                metadata.Artist ?? string.Empty,
+                metadata.Title ?? string.Empty,
+                score.BeatmapInfo?.DifficultyName ?? string.Empty,
+                ruleset,
+                score.Date,
+                score.BeatmapHash ?? string.Empty,
+                new FileEntry(hash, "replay.osr")));
+        }
+
+        replays.Sort((a, b) => a.Date.CompareTo(b.Date));
+
+        return replays;
     }
 }

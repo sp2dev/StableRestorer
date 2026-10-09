@@ -9,11 +9,11 @@
 
 ## 1. 项目定位
 
-把 osu!lazer 的哈希文件库（`files/{h0}/{h0h1}/{hash}`）按数据库里记录的原始文件名，
-还原成 osu!stable 的 `Songs/` 布局。
+把 osu!lazer 的本地数据（谱面 / 皮肤 / 本地回放）按数据库里记录的原始文件名，
+还原成 osu!stable 的目录布局。
 
 - 输入：osu!lazer 数据目录（`client.realm` + `files/`）
-- 输出：osu!stable 根目录下的 `Songs/`
+- 输出：`Songs/`、`Skins/`、`Replays/`（默认写在 stable 安装目录下）
 - 默认手段：硬链接（同一卷）；否则复制
 
 ### 硬性安全不变量（改动时必须保持）
@@ -24,6 +24,11 @@
 3. 只增不删。唯一允许的删除动作是 `--overwrite` 下替换**目标文件自身**，且前提是已确认它
    不是同一份文件。
 4. 已存在的同 inode 目标（已是硬链接）必须跳过，不得重复创建。
+5. **只读运行（体检）不得写入任何东西** —— 不写数据文件，也不创建目录。
+   由 `RestoreOptions.ReadOnly` 控制，只有这一种只读模式，没有第二套。唯一允许的写操作是在
+   **已存在**的目录里写一个探测文件再立刻删掉，用来验证可写性；目标目录不存在时改为检查最近的
+   **已存在**上级目录，而不是把它创建出来。这条是"体检"这个功能可信的前提，改动 `CheckTarget`
+   时必须保持。
 
 ---
 
@@ -39,22 +44,41 @@
 StableRestorer/
 ├─ RealmSchema/Models.cs     与 osu!lazer schema 52 逐字段对齐的 Realm 模型（见 §3）
 ├─ Lazer/LazerDatabase.cs    只读打开 client.realm，投影成纯 POCO 快照
-├─ IO/StableNaming.cs        文件夹命名与"从文件夹名解析 set id"
+├─ IO/StableNaming.cs        折叠命名/识别规则（谱面文件夹、皮肤文件夹、回放文件名、规则后缀）
 ├─ IO/FileSystem.cs          同 inode 判定、CreateHardLink、卷序列号比较
 ├─ IO/FileRestorer.cs        单文件的链接/复制/校验/冲突策略
-├─ Engine/RestoreOptions.cs  选项、目录护栏、报告数据结构
-├─ Engine/RestoreEngine.cs   已有文件夹扫描、set id 复用、过滤、统计
+├─ Engine/RestoreOptions.cs  选项、目标目录、分类统计与报告数据结构
+├─ Engine/RestoreEngine.cs   三类迁移（谱面/皮肤/回放）、复用、可用性检查、统计
+├─ Text.cs                   显示宽度计算与字节格式化（全工具唯一一份，见 §8）
+├─ Cli/Theme.cs              配色与排版（控制台颜色 API，见 §8）
+├─ Cli/ConsoleInput.cs       输入读取、目录/布尔问答、按键暂停（见 §8）
 ├─ Cli/CommandLine.cs        命令行帮助文本
 ├─ Cli/InstallLocator.cs     两端安装位置自动探测
+├─ Cli/ConsoleProgress.cs    单行进度显示（自己节流；重定向时改为按 10% 打点）
 ├─ Cli/SchemaProbe.cs        schemas 子命令
-├─ Cli/OsuDb.cs              osu!.db 读取器（实验性，见 §8）
 ├─ Cli/Wizard.cs             交互模式
-└─ Program.cs                命令分发、schema 探测、JSON 报告
+└─ Program.cs                命令分发、schema 探测、统计与摘要打印、JSON 报告
 ```
+
+分层原则：**引擎与 IO 层不打印任何东西**（除了 `--verbose` 的逐条明细），
+所有面向用户的排版、配色、对齐都在 `Cli/` 与 `Program.cs` 里。反过来，
+`Cli/` 只做展示与输入，不碰文件系统逻辑。
 
 关键分层：**`LazerDatabase` 把 Realm 数据投影成不可变 POCO 后立即释放 Realm**，
 之后所有文件系统操作都在普通对象上进行。Realm 对象是线程受限的，Realm 关闭后即失效，
-新增字段时必须同步到 `SongSnapshot` / `FileEntry`，不要在文件系统阶段回读 Realm。
+新增字段时必须同步到 `SongSnapshot` / `SkinSnapshot` / `ReplaySnapshot` / `FileEntry`，
+不要在文件系统阶段回读 Realm。
+
+### 三类的落点
+
+| 类别 | 快照类型 | 目标目录 | 命名规则 |
+| --- | --- | --- | --- |
+| 谱面 | `SongSnapshot` | `<out>/Songs` | `{setId} {artist} - {title}`（见 §5） |
+| 皮肤 | `SkinSnapshot` | `<out>/Skins` | `Skin.Name` 清洗后作为文件夹名 |
+| 回放 | `ReplaySnapshot` | `<out>/Replays` | `{玩家} - {artist} - {title} [{难度}] ({日期}) {规则}.osr` |
+
+`MigrateFile()` 是三条路径共用的单文件管线（路径安全检查 → `FileRestorer` → 计入分类统计），
+新增一类数据时复用它，不要各自重写计数逻辑。
 
 ---
 
@@ -83,7 +107,7 @@ Realm 会把"声明的 schema"与文件内的 schema 严格比对：只接受**�
 stablerestorer schemas --lazer <lazer数据目录>
 ```
 
-逐个候选版本报告"哪条声明与文件不一致"。加 `--verbose` 可在 `scan`/`restore` 里看到
+逐个候选版本报告"哪条声明与文件不一致"。加 `--verbose` 可在 `check`/`migrate` 里看到
 每个候选版本被拒的原因。
 
 ### 升级到新 lazer 版本时
@@ -110,7 +134,7 @@ osu! 的两级 ID 都唯一，本工具的一切匹配都围绕它们：
   注意这与 `BeatmapSetInfo.Protected` 不是同一个概念：
   `Protected` 表示"由 lazer 随游戏附带"，它**可能有** online ID，也可能没有。
   实测数据里两者不完全重合，所以判据用 set id，不要改回 `Protected`。
-- `scan` 会报告重复的 set id。真实数据里出现过重复，不要假设 set id 一定唯一，
+- 体检会报告重复的 set id。真实数据里出现过重复，不要假设 set id 一定唯一，
   但可以假设它**几乎**唯一。
 
 ---
@@ -148,11 +172,37 @@ realm : {id} Colors_Slash - ...             ← metadata 里有下划线
 ### 边界情况
 
 - **无数字前缀的老文件夹**：2007–2009 年左右的命名，解析不出 set id，因而不会被合并。
-  实测存在少量这类文件夹。想彻底解决需要读 stable 的 `osu!.db`（见 §8）。
+  实测存在少量这类文件夹。要彻底解决得读 stable 的 `osu!.db`（本工具不做，见 §13）。
 - **同一 set id 出现在多个文件夹**：真实数据里出现过（重复谱面集），
   目前两个都处理，不做特殊合并。
 - 报告里 `packagesReusedExistingFolder` 表示命中并复用了已有文件夹的数量，这是判断
   "会不会产生重复谱面"的核心指标。
+
+### 皮肤文件夹名（`SkinFolderName` / `SkinFolderMatchesName`）
+
+- 文件夹名 = `Skin.Name` 清洗后（非法字符换 `_`、去尾部空格与点、超长截断）；
+  名字清洗后为空时退回作者名，再退回 `未命名皮肤`。
+- **复用匹配必须保守**：stable 导入皮肤时会在名字后面补来源，例如 lazer 里叫 `X` 的皮肤在磁盘上
+  是 `X (hobby)` / `X (by someone)`。`SkinFolderMatchesName` 只接受"完全相同"或
+  `X (` 前缀，避免把两个不同皮肤合并进一个文件夹。
+  实测有名字差异较大的皮肤（lazer 里 `X skin remix`、磁盘上 `X remix (作者)`）不会命中，
+  结果是多一个文件夹而不是丢文件 —— 这是有意的取舍。
+
+### 回放文件名（`ReplayFileName` / `RulesetToken`）
+
+```text
+{玩家} - {artist} - {title} [{难度}] ({yyyy-MM-dd}) {规则}[-n].osr
+```
+
+- 规则后缀按 **stable 的命名**映射，不是直接用 lazer 的短名：
+  `fruits` → `Catch`、`mania` → `OsuMania`，其余（含自定义规则集如 `Sentakki`）用其短名。
+- 同一玩家 + 同一谱面 + 同一天有多份回放时追加 `-2`、`-3`…（与 stable 行为一致）。
+  真实数据里这类重复很多，不要以为是异常。
+- **必须先预留后缀再截断**：历史 bug 是先把整串截到 155 字符再拼规则后缀，
+  结果得到 `... OsuMa.osr` 这种残缺后缀。正确做法是把 `规则` + `.osr` 的长度从预算里扣掉，
+  只截断前面的"玩家 - artist - title [难度] (日期)"部分。
+- 两类分数在投影阶段就被丢弃：没有回放文件的、以及 `BeatmapInfo` 为空的
+  （没有元数据就无法构造稳定文件名）。后者在本机数据里有数百条，不要试图猜名字。
 
 ---
 
@@ -164,8 +214,11 @@ realm : {id} Colors_Slash - ...             ← metadata 里有下划线
 2. 源内容 SHA-256 与它的文件名不一致 → `SourceHashMismatch`，不写入（除非 `--no-verify-hash`）；
 3. 目标存在且与源**同 inode** → `AlreadyLinked`，跳过；
 4. 目标存在但内容不同 → 默认 `SkippedExisting` + 记入 notices，`--overwrite` 才替换；
-5. `--dry-run` → `PlannedOnly`，不做任何写入；
-6. **先创建父目录**，再创建文件。
+5. **先创建父目录**，再创建文件。
+
+只读运行（体检）**不会走到这里** —— `RestoreEngine.Run()` 在 `ReadOnly` 时只跑
+`RunAvailabilityChecks()`，所以 `FileRestorer` 里没有"演练"分支，也不该再加回来：
+一旦这里出现"不写入"的分支，就意味着某条只读路径绕过了 `ReadOnly` 的单一入口。
 
 ### 两个必须记住的文件系统事实
 
@@ -210,24 +263,52 @@ realm : {id} Colors_Slash - ...             ← metadata 里有下划线
 
 ---
 
-## 8. `osu!.db` 读取器：未完成，不要信任
+## 8. 输出层：对齐、配色与暂停
 
-`Cli/OsuDb.cs` + `osudb` 子命令的目标是读出 stable 自己记录的 folder name
-（用于那少数无数字前缀的老文件夹）。
+三个文件构成所有面向用户的输出，改排版时只动它们，不要在业务代码里手拼空格：
 
-**当前状态：解析不通过。** 难点在于不同 osu! 版本对
-(a) 字符串长度前缀（单字节 vs `0x0b` + 7-bit 变长）与
-(b) 时间戳字段字节数（7 vs 8）
-的写法不一致，一处判断错就会让后续所有字段整体错位。
+| 文件 | 职责 |
+| --- | --- |
+| `Text.cs` | `FormatSize`（全工具唯一一份）、`DisplayWidth` / `PadRight` / `Truncate` |
+| `Cli/Theme.cs` | 区块标题、键值行、结论行、`--no-color`/`NO_COLOR` 判定 |
+| `Cli/ConsoleInput.cs` | 读一行（剥 BOM）、目录/布尔/选项问答、按键暂停 |
 
-处理方式（改动时请保持这个原则）：reader 会自我校验 —— 玩家名是否合理、beatmap 数是否合理、
-解出的文件夹数是否等于文件头声明的数量 —— 任何一条不满足就抛
-`FormatNotUnderstoodException` 并**拒绝输出任何文件夹名**，退出码 6。
-**宁可失败，也不要给出看似合理实则错误的结果**：错位的解析会输出错误文件夹名，
-而这可能被用来删文件。
+### 对齐必须走显示宽度，不能数字符
 
-调试方法：读文件头前 ~200 字节的十六进制，按字段手工核对偏移，再决定布局假设。
-不要靠"读起来像"来推断。
+中文、全角标点在终端里占两列，`string.Length` 会算错（"皮肤写到"是 4 个字符、8 列）。
+`Theme.Item(label, value, color, labelWidth)` 用 `Text.PadRight` 补齐到**列宽**。
+
+`labelWidth` 是**每张表**的属性，不是每行的：同一张表里给了不同宽度，冒号就会参差不齐。
+`Program.cs` 里用 `Stat()` / `Sum()` 两个薄包装固定列宽（24 / 20），新增统计行时用它们，
+不要直接调 `Theme.Item` 混用默认值。列宽不够时症状是"只有长标签那几行冒号偏右"。
+
+### 配色只用控制台颜色 API
+
+用 `Console.ForegroundColor` 而不是 ANSI 转义序列，理由是可验证的：
+
+- 老 conhost、Windows Terminal、重定向到文件三种情况都不会出问题；
+- 输出被重定向时 .NET 直接忽略颜色设置 —— **重定向的日志里不可能出现控制字符**，
+  不需要"记得关颜色"这种口头约定；
+- 不需要 P/Invoke 开 VT、也不需要失败回退。
+
+`Theme.Enabled` 在 `--no-color`、`NO_COLOR` 非空、或 stdout 被重定向时为 false，
+此时所有 `Write` 都退化成纯文本。**新增输出必须经由 Theme**，直接 `Console.ForegroundColor`
+会让上面这条保证失效。
+
+进度行走的是 **stderr**，所以它用 `Theme.WriteError` 而不是 `Theme.Write`；
+两者混用会让同一行分到两股流上，在终端里交错成乱码。
+
+### 暂停（`ConsoleInput.Pause`）
+
+交互模式在**体检和迁移结束后**各停一次，否则摘要会被下一轮的主界面顶掉。
+
+- stdin 连着终端：`Console.ReadKey(intercept: true)`；
+- stdin 被重定向（脚本驱动）：改为 `ReadLine()` 读掉一行。
+  **不能**在重定向时调 `Console.ReadKey` —— 它会抛 `InvalidOperationException`；
+  读到文件结尾会立刻返回，不会把脚本挂住。
+- 仍在捕获 `InvalidOperationException` 作为兜底（例如有 stdin 句柄但不可读）。
+
+脚本驱动交互模式时记得**多喂一行**给暂停，否则后面的输入会整体错位（见 §9）。
 
 ---
 
@@ -235,21 +316,44 @@ realm : {id} Colors_Slash - ...             ← metadata 里有下划线
 
 流程：**读/建配置 → 自动探测 → 显示当前配置与警告 → 菜单**。
 
+菜单（体检与可用性检查已合并成一项，共 5 项）：
+
+```text
+  1) 体检          统计能迁移什么 + 检查目标目录与硬链接（不写任何文件）
+  2) 开始迁移      真正创建文件
+  3) 修改设置      选择要迁移的内容、指定目录与选项
+  4) 帮助          显示完整命令行用法
+  0) 退出
+```
+
+此前"体检"和"测试可用性"是两个菜单项，现在已经合并 —— 统计与可用性检查共用
+`Program.ExecuteCheck()`，数据库只读一次，避免让用户跑两遍几乎相同的东西。
+
+**菜单项序号会变**：曾经有四处写死"请先选 4 修改设置"的提示语，菜单合并后全指向了错误的项。
+改动菜单顺序时，用 grep 搜 `修改设置` 把提示语一起改掉，不要只改菜单本身。
+
+- 体检与迁移结束后各暂停一次（`ConsoleInput.Pause`，见 §8），按键才回主菜单。
+- 配置项用 `Theme.Item` 输出，标签列宽默认 16（最长标签"osu!lazer 目录"占 15 列）。
 - 配置文件 `stablerestorer.settings.json` 放在 exe 同目录；写不进去则退到
-  `%APPDATA%\StableRestorer`。
+  `%APPDATA%\StableRestorer`。里面除了两个路径，还有三个 `MigrateSongs/Skins/Replays` 开关
+  与各选项；**旧配置文件缺字段时靠默认值补齐**，所以加字段是安全的。
 - 无参数启动**且 stdin 未重定向**时进入交互；重定向（脚本调用）时打印用法，避免挂住。
   显式 `interactive` 始终生效。
 - 输出目录不单独设置：目标就是 stable 安装目录（`OutputDirectory == StableDirectory`）。
+  主界面会把三个实际落点（`Songs`/`Skins`/`Replays`）都列出来。
 - 主界面显示硬链接可行性：用 `GetVolumeInformationW` 比较卷序列号，
   不同卷时给出明确警告。
 - 输入读取会剥掉 UTF-8 BOM —— 用管道喂输入时很容易带上，否则菜单项会识别失败。
-- 真实还原前必须打印摘要并要求确认。
+- 真实迁移前必须打印摘要并要求确认。菜单第 1 项（体检）会走一遍完整映射但不写任何东西
+  （连目录都不创建），所以"体检通过"之后紧接着迁移不会再遇到路径或来源问题。
+- 用户可见文本**全部是中文**，包括进度行与错误信息。
 
 ### 交互模式的危险点
 
-"开始还原"会**直接写进真实 stable 安装目录**。用脚本/管道驱动交互模式做测试时，
+"开始迁移"会**直接写进真实 stable 安装目录**。用脚本/管道驱动交互模式做测试时，
 一定要先把 stable 指向测试目录；如果目录不存在，`PromptDirectory` 会拒绝并**保留原值**，
 脚本的后续输入会错位，可能就在真实目录上跑起来（这个坑真实发生过，并产生了重复文件夹）。
+更安全的做法是脚本里先喂 `1`（体检）而不是 `2`（迁移）。
 
 ---
 
@@ -274,33 +378,49 @@ dotnet publish StableRestorer.csproj -c Release -r win-x64
 没有单元测试项目。改动后建议按下面的顺序自查：
 
 ```powershell
-# 1) 只读体检验证读取层
-stablerestorer scan --lazer <lazer数据目录>
-#    期望：hashed files missing = 0；文件夹样例的命名符合 {setId} {artist} - {title}
+# 1) 体检：只统计（不给 --out，或加 --no-target-check），验证读取层
+stablerestorer check --lazer <lazer数据目录> --no-target-check
+#    期望：缺失的文件 = 0；示例命名符合
+#      Songs/{setId} {artist} - {title}
+#      Skins/{皮肤名}
+#      Replays/{玩家} - {artist} - {title} [{难度}] ({日期}) {规则}.osr
 
-# 2) 演练 + 输出到独立目录，验证映射与护栏
-stablerestorer restore --lazer <lazer数据目录> --out <测试目录> --stable <stable目录> --dry-run
+# 2) 完整体检（统计 + 可用性），指向独立目录，同时验证映射、可写性与护栏
+stablerestorer check --lazer <lazer数据目录> --out <测试目录> --stable <stable目录>
+#    期望：全部 [通过]；退出码 0
+#    另需确认：跑完之后 <测试目录> 里**什么都没多出来**（体检不写任何东西）
 
-# 3) 与 CLI 输出交叉核对（交互模式的服务对象是同一套引擎）
-stablerestorer restore --lazer <lazer数据目录> --out <stable目录> --stable <stable目录>
+# 3) 正式迁移到独立目录，与 CLI 输出交叉核对
+stablerestorer migrate --lazer <lazer数据目录> --out <测试目录> --stable <stable目录>
 
 # 4) 核对报告与磁盘
-#    - packages 数 == Songs 下文件夹数
-#    - filesPlanned - 被跳过的文件 == Songs 下文件数
-#    - 逐包 linked + copied + skipped + missing + failed == files
+#    - categories[].items == 目标目录下的条目数（Songs 文件夹 / Skins 文件夹 / Replays 文件）
+#    - categories[].filesPlanned == 该目录下的文件数
 #    - failures = 0
+```
+
+分类迁移可以单独跑，便于隔离问题：
+
+```powershell
+stablerestorer migrate --lazer <lazer> --out <测试目录> --only skins,replays   # 不动谱面
 ```
 
 独立验证手段：
 
 ```powershell
-# 硬链接是否真的建立（同一内容出现在还原目录与 lazer 曲库）
-fsutil hardlink list "<还原目录>\Songs\<某文件夹>\<某文件>"
+# 硬链接是否真的建立（同一内容出现在迁移目录与 lazer 曲库）
+fsutil hardlink list "<测试目录>\Songs\<某文件夹>\<某文件>"
 
 # 内容抽查：随机取文件算 SHA-256，确认能在 lazer 曲库里找到同名哈希文件
-Get-FileHash "<还原目录>\Songs\<文件夹>\<文件>" -Algorithm SHA256
+Get-FileHash "<测试目录>\Songs\<文件夹>\<文件>" -Algorithm SHA256
 
-# 是否会重复：命中复用的包数应等于 set id 两边都有的数量，且不产生同名新目录
+# 是否会重复：
+#   - 谱面：报告 packagesReusedExistingFolder 应等于两边 set id 的交集数量，且不产生同名新目录
+#   - 皮肤：预置一个 "X (hobby)" 文件夹后迁移，条目数不应增加
+
+# 回放命名自检：不该出现被截断的规则后缀（例如 "... OsuMa.osr"）
+Get-ChildItem "<测试目录>\Replays" -File |
+  Where-Object { $_.BaseName -notmatch '\s(Osu|Taiko|Catch|OsuMania)(-\d+)?$' }
 ```
 
 ### 脚本驱动的注意事项
@@ -308,6 +428,7 @@ Get-FileHash "<还原目录>\Songs\<文件夹>\<文件>" -Algorithm SHA256
 - **不要用 `| Select-Object -First N` 截断输出**：PowerShell 会提前关闭管道并终止进程，
   JSON 报告可能没写完就退出。要完整输出用 `| Out-String -Width 200`。
 - 交互模式用管道喂输入时注意 BOM 与提示行数量，行数对不上会导致输入错位（见 §9）。
+  体检和迁移结束后会**吃掉一行**用于暂停，脚本里记得补上（`"1`n`n0`n"` 这种）。
 - 中文文本文件**不要**用 `Get-Content`/`Set-Content` 往返改写：在非 UTF-8 默认代码页的
   PowerShell 里会把 UTF-8 当 GBK 读，整份文件变乱码。用文件编辑工具直接读写。
 
@@ -330,10 +451,11 @@ Get-FileHash "<还原目录>\Songs\<文件夹>\<文件>" -Algorithm SHA256
 
 ## 13. 未完成 / 后续方向
 
-- 皮肤（`Skins/`，注意 `Protected = true` 是内置皮肤应跳过）、回放（`Score.Files` → `.osr`）、
-  `collection.db`：Realm 模型已声明，扩展 `RestoreEngine` 即可。
-- 生成 `osu!.db`：未做。依赖 §8。
+- `collection.db`（收藏夹）：未做。它是 SQLite，可以从 `BeatmapCollection` 重建。
+- 生成 `osu!.db` / `scores.db`：未做。需要先有一个可信的 `osu!.db` 写入器，
+  读的那一半（旧的无数字前缀文件夹名）曾经写过一版实验性 reader，因为字段布局判断不可靠
+  已经删掉 —— 与其输出看起来合理实则错位的文件夹名，不如不做。
 - 清理/回滚：未做。因为用的是硬链接，删目录不会影响 lazer 数据，可以安全手工删。
-- 交互模式补充"预览将要跳过的谱面集清单"，减少误操作。
+- 交互模式补充"预览将要跳过的条目清单"，减少误操作。
 - 性能：单线程顺序执行，主要耗时是逐个源文件的 SHA-256 校验。
-  同一哈希被多张谱面引用时会重复校验，可以按哈希去重。
+  同一哈希被多张谱面引用时会重复校验，可以按哈希去重（回放与皮肤也有同类重复）。

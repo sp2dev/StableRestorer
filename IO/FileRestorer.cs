@@ -29,9 +29,6 @@ public enum FileOutcome
     /// <summary>The destination already existed and was replaced.</summary>
     Replaced,
 
-    /// <summary>Nothing was written because this was a dry run.</summary>
-    PlannedOnly,
-
     /// <summary>The hashed file is missing from the lazer file store.</summary>
     SourceMissing,
 
@@ -66,9 +63,14 @@ public sealed class FileRestorer
         Directory.CreateDirectory(directory);
     }
 
-    public FileResult Restore(string packageName, string destinationPath, string sourcePath, string expectedHash)
+    /// <param name="relativeLabel">
+    /// Human-readable location used in reports. It is passed in rather than derived, because a run
+    /// writes into several target trees (Songs/, Skins/, Replays/) and the CLI can point them
+    /// anywhere.
+    /// </param>
+    public FileResult Restore(string packageName, string destinationPath, string sourcePath, string expectedHash, string relativeLabel)
     {
-        string relative = Path.GetRelativePath(_options.OutputDirectory, destinationPath);
+        string relative = relativeLabel;
 
         if (!File.Exists(sourcePath))
             return new FileResult(packageName, relative, expectedHash, FileOutcome.SourceMissing, sourcePath);
@@ -78,17 +80,15 @@ public sealed class FileRestorer
 
         bool destinationExists = File.Exists(destinationPath);
 
-        if (destinationExists)
+        // 目标已经在，而且不是"覆盖"模式：同 inode 就是已经链好了，直接跳过；
+        // 内容不同的目标文件留原样并记录（只有 --overwrite 才替换）。
+        if (destinationExists && !_options.Overwrite)
         {
             if (FileSystem.IsSameFile(sourcePath, destinationPath))
                 return new FileResult(packageName, relative, expectedHash, FileOutcome.AlreadyLinked);
 
-            if (!_options.Overwrite)
-                return new FileResult(packageName, relative, expectedHash, FileOutcome.SkippedExisting, destinationPath);
+            return new FileResult(packageName, relative, expectedHash, FileOutcome.SkippedExisting, destinationPath);
         }
-
-        if (_options.DryRun)
-            return new FileResult(packageName, relative, expectedHash, FileOutcome.PlannedOnly);
 
         // Both CreateHardLink and File.Copy need the parent directory to exist, and Realm
         // filenames can nest (storyboard assets), so this cannot be done once per package.

@@ -6,32 +6,35 @@ using StableRestorer.Lazer;
 namespace StableRestorer.Cli;
 
 /// <summary>
-/// Interactive front end for the same operations the CLI exposes. No windowing or TUI dependency:
-/// it only reads lines from stdin and writes to stdout, so it runs in any terminal (including a
-/// plain console window) and stays usable over a remote session.
+/// 交互式前端，服务的是和命令行完全相同的一套引擎。不使用任何图形界面或 TUI 库，
+/// 只读写标准输入输出，因此在任何终端里都能跑，也能通过远程会话使用。
 ///
-/// Flow: read (or create) the settings file -> auto-detect both installs -> show the current
-/// configuration and any warnings -> let the user pick an operation.
+/// 流程：读（或新建）配置文件 → 自动探测两端安装位置 → 回主界面显示当前配置与警告 → 选操作。
+/// 迁移与体检结束后会停下来等一次按键，否则摘要会被下一轮的主界面顶掉。
 /// </summary>
 public static class Wizard
 {
     private sealed class Settings
     {
-        /// <summary>osu!lazer data directory (holds client.realm and files/).</summary>
+        /// <summary>osu!lazer 数据目录（含 client.realm 与 files）。</summary>
         public string? Lazer { get; set; }
 
         /// <summary>
-        /// osu!stable install root. The output directory is deliberately not a separate setting:
-        /// the restored Songs/ tree is written straight into this install.
+        /// osu!stable 安装目录。输出目录不单独设置：迁移结果直接写进这个安装目录。
         /// </summary>
         public string? Stable { get; set; }
 
+        // 迁移内容，默认三样都迁移。
+        public bool MigrateSongs { get; set; } = true;
+        public bool MigrateSkins { get; set; } = true;
+        public bool MigrateReplays { get; set; } = true;
+
         public string Mode { get; set; } = "hardlink";
 
-        /// <summary>Skip maps that have no online id (never submitted to osu!). Default on.</summary>
-        public bool SkipUnsubmitted { get; set; } = true;
+        /// <summary>是否导入没有 online ID 的未提交谱面。默认不导入。</summary>
+        public bool KeepUnsubmitted { get; set; }
 
-        /// <summary>Reuse the folder name of an existing stable folder for the same set id.</summary>
+        /// <summary>按 set id 复用已有 stable 文件夹名。默认开启。</summary>
         public bool ReuseExisting { get; set; } = true;
 
         public bool VerifyHashes { get; set; } = true;
@@ -46,7 +49,7 @@ public static class Wizard
 
             try
             {
-                // Next to the executable when published; falls back to app data if that is read-only.
+                // 发布后与 exe 同目录；写不进去则退到用户配置目录。
                 string candidate = Path.Combine(baseDirectory, "stablerestorer.settings.json");
                 File.WriteAllText(candidate + ".probe", string.Empty);
                 File.Delete(candidate + ".probe");
@@ -69,74 +72,87 @@ public static class Wizard
 
         var settings = LoadOrCreateSettings(out bool createdNew, out string? loadedFrom);
 
-        Welcome(createdNew, loadedFrom);
+        Banner(createdNew, loadedFrom);
 
         while (true)
         {
             ShowConfiguration(settings);
+            ShowMenu();
 
-            Console.WriteLine("请选择操作：");
-            Console.WriteLine("  1) 体检        只读取 lazer 数据库，报告能还原什么（不写任何文件）");
-            Console.WriteLine("  2) 演练        完整走一遍并校验，但不写文件，用来先看清单");
-            Console.WriteLine("  3) 开始还原    真正创建硬链接");
-            Console.WriteLine("  4) 修改设置    重新指定 lazer / stable 目录与选项");
-            Console.WriteLine("  5) 帮助        显示完整命令行用法");
-            Console.WriteLine("  0) 退出");
-            Console.WriteLine();
-
-            string choice = Prompt("输入序号", "0").Trim();
+            string choice = ConsoleInput.Prompt("输入序号", "0").Trim();
 
             try
             {
                 switch (choice)
                 {
                     case "1":
-                        ScanFlow(settings);
+                        CheckFlow(settings);
                         break;
 
                     case "2":
-                        RestoreFlow(settings, dryRun: true);
+                        MigrateFlow(settings);
                         break;
 
                     case "3":
-                        RestoreFlow(settings, dryRun: false);
-                        break;
-
-                    case "4":
                         SettingsFlow(settings);
                         break;
 
-                    case "5":
+                    case "4":
                         Console.WriteLine();
                         Console.WriteLine(CommandLine.Usage);
                         break;
 
                     case "0":
                     case "":
-                        Console.WriteLine("已退出。");
+                        Theme.WriteLine("已退出。");
                         return 0;
 
                     default:
-                        Warn($"无法识别的序号 '{choice}'。");
+                        Theme.Warn($"  ! 无法识别的序号 '{choice}'。");
                         break;
                 }
             }
             catch (LazerSchemaMismatchException ex)
             {
                 Console.Error.WriteLine();
-                Error("无法打开 client.realm（Realm 数据库结构与本程序内置的版本不一致）。");
-                Console.Error.WriteLine("  " + FirstLines(ex.Message, 6));
-                Console.Error.WriteLine("  在“修改设置”里可以指定 schema 版本，也可以用 schemas 子命令排查。");
+                Theme.Error("错误：无法打开 client.realm（Realm 数据库结构与本程序内置的版本不一致）。");
+                Theme.Error("      " + FirstLines(ex.Message, 6));
+                Theme.Error("      可以用 schemas 子命令排查，或用 --schema-version 指定版本。");
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine();
-                Error($"{ex.GetType().Name}: {ex.Message}");
+                Theme.Error($"错误：{ex.GetType().Name}：{ex.Message}");
             }
         }
     }
 
-    #region startup
+    #region 启动
+
+    private static void ShowMenu()
+    {
+        Console.WriteLine("请选择操作：");
+        MenuItem("1", "体检", "统计能迁移什么 + 检查目标目录与硬链接（不写任何文件）");
+        MenuItem("2", "开始迁移", "真正创建文件");
+        MenuItem("3", "修改设置", "选择要迁移的内容、指定目录与选项");
+        MenuItem("4", "帮助", "显示完整命令行用法");
+        MenuItem("0", "退出", string.Empty);
+        Console.WriteLine();
+    }
+
+    private static void MenuItem(string key, string title, string description)
+    {
+        Theme.Write($"  {key}) ", Theme.AccentColor);
+
+        if (description.Length == 0)
+        {
+            Theme.WriteLine(title, ConsoleColor.White);
+            return;
+        }
+
+        Theme.Write(Text.PadRight(title, 14), ConsoleColor.White);
+        Theme.Hint(description);
+    }
 
     private static Settings LoadOrCreateSettings(out bool createdNew, out string? loadedFrom)
     {
@@ -153,17 +169,17 @@ public static class Wizard
                     createdNew = false;
                     loadedFrom = path;
 
-                    // Fill in anything the file does not cover, so older settings files keep working.
+                    // 老配置文件缺的字段用自动探测补齐。
                     loaded.Lazer ??= InstallLocator.DetectLazer();
                     loaded.Stable ??= InstallLocator.DetectStable().Path;
 
-                    Console.WriteLine($"已读取配置文件：{path}");
+                    Theme.Hint($"已读取配置文件：{path}");
                     return loaded;
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"配置文件无法解析（{ex.Message}），将改用自动探测。");
+                Theme.Warn($"  ! 配置文件无法解析（{ex.Message}），改用自动探测。");
             }
         }
 
@@ -176,59 +192,78 @@ public static class Wizard
             Stable = InstallLocator.DetectStable().Path,
         };
 
-        Console.WriteLine($"没有找到配置文件，已新建一份并自动探测安装位置：{path}");
+        Theme.Hint($"未找到配置文件，已新建一份并自动探测安装位置：{path}");
         SaveSettings(settings, quiet: true);
 
         return settings;
     }
 
-    private static void Welcome(bool createdNew, string? loadedFrom)
+    private static void Banner(bool createdNew, string? loadedFrom)
     {
         Console.WriteLine();
-        Console.WriteLine("============================================================");
-        Console.WriteLine($"  StableRestorer {CommandLine.Version}");
-        Console.WriteLine("  把 osu!lazer 的曲库还原成 osu!stable 的 Songs 目录");
-        Console.WriteLine("============================================================");
+        Theme.WriteLine("============================================================", Theme.AccentColor);
+        Theme.WriteLine($"  StableRestorer {CommandLine.Version}", Theme.AccentColor);
+        Theme.WriteLine("  把 osu!lazer 的曲库、皮肤与本地回放迁移到 osu!stable", ConsoleColor.White);
+        Theme.WriteLine("============================================================", Theme.AccentColor);
         Console.WriteLine();
 
         if (createdNew)
-            Console.WriteLine("首次运行：已自动寻找两边的安装位置（可用“修改设置”更正）。");
+            Theme.Hint("首次运行：已自动寻找两边的安装位置（可用“修改设置”更正）。");
         else if (loadedFrom != null)
-            Console.WriteLine("已载入上次使用的设置。");
+            Theme.Hint("已载入上次使用的设置。");
     }
 
     /// <summary>
-    /// The main screen's configuration block: every path in use, plus anything that would make the
-    /// run behave differently from what the user probably expects.
+    /// 主界面的配置区块：所有会用到的路径与选项，外加任何会让实际行为和预期不一致的警告。
     /// </summary>
     private static void ShowConfiguration(Settings settings)
     {
-        Console.WriteLine();
-        Console.WriteLine("──────────── 当前配置 ────────────");
+        Theme.Section("当前配置");
 
         string? lazer = settings.Lazer;
         bool lazerOk = lazer != null && File.Exists(Path.Combine(lazer, "client.realm"));
-        Console.WriteLine($"  osu!lazer 目录 : {FormatPath(lazer, lazerOk)}");
+        Theme.Item("osu!lazer 目录", FormatPath(lazer, lazerOk), lazerOk ? null : Theme.CautionColor);
 
         string? stable = settings.Stable;
         bool stableOk = stable != null && Directory.Exists(stable);
-        Console.WriteLine($"  osu!stable目录 : {FormatPath(stable, stableOk)}");
+        Theme.Item("osu!stable 目录", FormatPath(stable, stableOk), stableOk ? null : Theme.CautionColor);
 
         if (stableOk)
-            Console.WriteLine($"  还原到         : {InstallLocator.ResolveStableSongsDirectory(stable!)}");
+        {
+            Theme.Item("谱面写到", Path.Combine(stable!, "Songs"));
+            Theme.Item("皮肤写到", Path.Combine(stable!, "Skins"));
+            Theme.Item("回放写到", Path.Combine(stable!, "Replays"));
+        }
 
-        Console.WriteLine($"  文件方式       : {(settings.Mode == "copy" ? "复制（会额外占用等量空间）" : "硬链接（同一分区时不额外占用空间）")}");
-        Console.WriteLine($"  未提交谱面     : {(settings.SkipUnsubmitted ? "不导入（没有 online ID 的谱面）" : "一并导入")}");
-        Console.WriteLine($"  复用已有文件夹 : {(settings.ReuseExisting ? "是（按 set id 匹配，避免重复谱面）" : "否")}");
-        Console.WriteLine($"  校验 SHA-256   : {(settings.VerifyHashes ? "是" : "否")}");
-        Console.WriteLine($"  覆盖同名文件   : {(settings.Overwrite ? "是" : "否（内容不同时跳过并记录）")}");
-
-        Console.WriteLine("──────────────────────────────────");
-
-        foreach (string warning in CollectWarnings(settings))
-            Console.WriteLine($"  ⚠ {warning}");
+        Theme.Item("迁移内容", DescribeSelection(settings));
+        Theme.Item("文件方式", settings.Mode == "copy" ? "复制（会额外占用等量空间）" : "硬链接（同一分区时不额外占用空间）");
+        Theme.Item("未提交谱面", settings.KeepUnsubmitted ? "一并导入" : "不导入（没有 online ID 的谱面）");
+        Theme.Item("复用已有文件夹", settings.ReuseExisting ? "是（按 set id 匹配，避免重复谱面）" : "否");
+        Theme.Item("校验 SHA-256", settings.VerifyHashes ? "是" : "否");
+        Theme.Item("覆盖同名文件", settings.Overwrite ? "是" : "否（内容不同时跳过并记录）");
 
         Console.WriteLine();
+
+        foreach (string warning in CollectWarnings(settings))
+            Theme.Warn("  ⚠ " + warning);
+
+        Console.WriteLine();
+    }
+
+    private static string DescribeSelection(Settings settings)
+    {
+        var parts = new List<string>();
+
+        if (settings.MigrateSongs)
+            parts.Add("谱面");
+
+        if (settings.MigrateSkins)
+            parts.Add("皮肤");
+
+        if (settings.MigrateReplays)
+            parts.Add("回放");
+
+        return parts.Count == 0 ? "（未选择任何内容）" : string.Join("、", parts);
     }
 
     private static string FormatPath(string? path, bool ok)
@@ -240,8 +275,8 @@ public static class Wizard
     }
 
     /// <summary>
-    /// Everything worth warning about before a long run: missing paths, a volume split that forces
-    /// copying, and a stable folder that is missing the layout the restore assumes.
+    /// 一次长时间运行前值得提醒的所有事情：路径缺失、跨分区导致必须复制、
+    /// stable 目录缺少迁移所需的布局。
     /// </summary>
     private static IEnumerable<string> CollectWarnings(Settings settings)
     {
@@ -260,6 +295,9 @@ public static class Wizard
                 yield return problem;
         }
 
+        if (!settings.MigrateSongs && !settings.MigrateSkins && !settings.MigrateReplays)
+            yield return "没有选择任何要迁移的内容，迁移不会有任何效果。";
+
         if (string.IsNullOrWhiteSpace(settings.Lazer) || string.IsNullOrWhiteSpace(settings.Stable))
             yield break;
 
@@ -271,84 +309,138 @@ public static class Wizard
             yield break;
         }
 
-        var verdict = FileSystem.CanHardLinkBetween(lazerFiles, settings.Stable);
-
-        if (verdict == HardLinkVerdict.DifferentVolume)
+        if (string.Equals(Path.GetFullPath(lazerFiles), Path.GetFullPath(settings.Stable), StringComparison.OrdinalIgnoreCase))
         {
-            yield return "lazer 曲库和 stable 目录不在同一个磁盘分区，无法创建硬链接；";
-            yield return "  还原时会改为复制文件，会额外占用与曲库等量的磁盘空间。";
+            yield return "osu!stable 目录就是 lazer 的数据目录，两者必须分开。";
+            yield break;
         }
-        else if (verdict == HardLinkVerdict.Unknown && settings.Mode != "copy")
+
+        switch (FileSystem.CanHardLinkBetween(lazerFiles, settings.Stable))
         {
-            yield return "无法确认两边是否在同一分区，若不能硬链接会自动改为复制。";
+            case HardLinkVerdict.DifferentVolume:
+                yield return "lazer 曲库和 stable 目录不在同一个磁盘分区，无法创建硬链接；";
+                yield return "  迁移时会改为复制文件，会额外占用与曲库等量的磁盘空间。";
+                break;
+
+            case HardLinkVerdict.Unknown when settings.Mode != "copy":
+                yield return "无法确认两边是否在同一分区，若不能硬链接会自动改为复制。";
+                break;
         }
     }
 
     #endregion
 
-    #region flows
+    #region 操作流程
 
     private static void SettingsFlow(Settings settings)
     {
-        Console.WriteLine();
-        Console.WriteLine("──────────── 修改设置 ────────────");
-        Console.WriteLine("每一步直接回车 = 保持当前值。");
+        Theme.Section("修改设置");
+        Theme.Hint("每一步直接回车 = 保持当前值。");
 
-        settings.Lazer = PromptDirectory(
+        settings.Lazer = ConsoleInput.PromptDirectory(
             "osu!lazer 数据目录（应包含 client.realm 与 files）",
             settings.Lazer,
             requireClientRealm: true);
 
-        settings.Stable = PromptDirectory(
-            "osu!stable 安装目录（还原结果写进它的 Songs）",
+        settings.Stable = ConsoleInput.PromptDirectory(
+            "osu!stable 安装目录（迁移结果写进它的 Songs / Skins / Replays）",
             settings.Stable,
             requireClientRealm: false);
 
         Console.WriteLine();
-        settings.SkipUnsubmitted = PromptBool(
-            "不导入未提交谱面（没有 online ID 的谱面，stable 里没有对应曲目）",
-            settings.SkipUnsubmitted);
+        Console.WriteLine("要迁移哪些内容？（可分别开关，回车保持不变）");
 
-        settings.ReuseExisting = PromptBool(
+        settings.MigrateSongs = ConsoleInput.PromptBool("  谱面（Songs）", settings.MigrateSongs);
+        settings.MigrateSkins = ConsoleInput.PromptBool("  皮肤（Skins，跳过随游戏附带的）", settings.MigrateSkins);
+        settings.MigrateReplays = ConsoleInput.PromptBool("  本地回放（Replays）", settings.MigrateReplays);
+
+        Console.WriteLine();
+        settings.KeepUnsubmitted = ConsoleInput.PromptBool(
+            "导入没有 online ID 的未提交谱面（stable 里没有对应曲目，默认不导入）",
+            settings.KeepUnsubmitted);
+
+        settings.ReuseExisting = ConsoleInput.PromptBool(
             "按 set id 复用已有 stable 文件夹（避免产生重复谱面）",
             settings.ReuseExisting);
 
-        settings.VerifyHashes = PromptBool(
+        settings.VerifyHashes = ConsoleInput.PromptBool(
             "校验每个源文件的 SHA-256 与文件名是否一致（更慢但更安全）",
             settings.VerifyHashes);
 
-        settings.Mode = PromptChoice("文件创建方式", new[] { "hardlink", "copy" }, settings.Mode);
+        settings.Mode = ConsoleInput.PromptChoice("文件创建方式", new[] { "hardlink", "copy" }, settings.Mode);
 
-        settings.Overwrite = PromptBool(
+        settings.Overwrite = ConsoleInput.PromptBool(
             "覆盖内容不同的同名文件（默认跳过并记录）",
             settings.Overwrite);
 
         SaveSettings(settings, quiet: false);
 
         Console.WriteLine();
-        Console.WriteLine("设置已保存，下面是更新后的配置。");
+        Theme.Ok("设置已保存，下面是更新后的配置。");
     }
 
-    private static void ScanFlow(Settings settings)
+    /// <summary>
+    /// 体检：统计数据库里有什么，再跑一遍只读检查（目标目录、硬链接可行性、缺文件、
+    /// 每个目标路径是否会被拒绝）。全程不写入，也不创建目录。
+    /// </summary>
+    private static void CheckFlow(Settings settings)
     {
         if (!RequirePaths(settings))
             return;
 
-        int schema = Program.ResolveSchema(settings.Lazer!, Array.Empty<string>());
+        if (!AnySelection(settings))
+            return;
 
-        Console.WriteLine();
-        Console.WriteLine($"正在读取 {Path.Combine(settings.Lazer!, "client.realm")} ...");
-        Console.WriteLine();
+        string stableRoot = Path.GetFullPath(settings.Stable!);
 
-        Program.Scan(settings.Lazer!, schema);
+        var options = new RestoreOptions
+        {
+            LazerDataDirectory = Path.GetFullPath(settings.Lazer!),
+            OutputDirectory = stableRoot,
+            StableDirectory = stableRoot,
+            Selection = new MigrateSelection(settings.MigrateSongs, settings.MigrateSkins, settings.MigrateReplays),
+            ReuseExistingFolders = settings.ReuseExisting,
+            SkipUnsubmitted = !settings.KeepUnsubmitted,
+            ReadOnly = true,
+            CheckTargets = true,
+            Quiet = true,
+            Progress = ConsoleProgress.Create(quiet: false),
+        };
 
-        Console.WriteLine();
-        Console.WriteLine("如果上面 “hashed files missing” 是 0，说明 lazer 曲库里的文件都是齐的。");
+        options.ValidateDirectories();
+
+        Theme.WriteLine();
+        Theme.WriteLine($"{CommandLine.ToolName} {CommandLine.Version} — 体检（只读）", Theme.AccentColor);
+        Theme.Item("lazer 数据目录", options.LazerDataDirectory + "（只读）");
+        Theme.Item("检查内容", options.Selection.ToString());
+        Theme.Item("谱面目标", Path.Combine(stableRoot, "Songs"));
+        Theme.Item("皮肤目标", Path.Combine(stableRoot, "Skins"));
+        Theme.Item("回放目标", Path.Combine(stableRoot, "Replays"));
+        Theme.Hint("  体检不会写入任何文件，也不会创建任何目录。");
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        int exitCode = Program.ExecuteCheck(options, Program.ResolveSchema(options.LazerDataDirectory, Array.Empty<string>()));
+
+        watch.Stop();
+
+        Theme.WriteLine();
+        Theme.Hint($"  体检用时 {watch.Elapsed.TotalSeconds:N1} 秒。");
+
+        if (exitCode == 0)
+            Theme.Ok("  接着可以回主菜单选 2 开始迁移。");
+        else
+            Theme.Warn("  请先按上面的提示处理，再考虑迁移。");
+
+        ConsoleInput.Pause();
     }
 
-    private static void RestoreFlow(Settings settings, bool dryRun)
+    private static void MigrateFlow(Settings settings)
     {
         if (!RequirePaths(settings))
+            return;
+
+        if (!AnySelection(settings))
             return;
 
         string stableRoot = Path.GetFullPath(settings.Stable!);
@@ -357,87 +449,74 @@ public static class Wizard
         {
             LazerDataDirectory = Path.GetFullPath(settings.Lazer!),
 
-            // The output is the stable install itself - there is no separate destination to pick.
+            // 输出就是 stable 安装本身 —— 没有单独的"输出目录"要选。
             OutputDirectory = stableRoot,
             StableDirectory = stableRoot,
+            Selection = new MigrateSelection(settings.MigrateSongs, settings.MigrateSkins, settings.MigrateReplays),
             ReuseExistingFolders = settings.ReuseExisting,
-            SkipUnsubmitted = settings.SkipUnsubmitted,
+            SkipUnsubmitted = !settings.KeepUnsubmitted,
             Mode = settings.Mode.Equals("copy", StringComparison.OrdinalIgnoreCase)
                 ? RestoreMode.Copy
                 : RestoreMode.HardLink,
-            DryRun = dryRun,
             Overwrite = settings.Overwrite,
             VerifyHashes = settings.VerifyHashes,
             Quiet = true,
+            Progress = ConsoleProgress.Create(quiet: false),
         };
 
         options.ValidateDirectories();
 
-        Console.WriteLine();
-        Console.WriteLine("即将执行：");
-        Console.WriteLine($"  lazer 目录   : {options.LazerDataDirectory}  (只读)");
-        Console.WriteLine($"  写入 stable  : {InstallLocator.ResolveStableSongsDirectory(stableRoot)}");
-        Console.WriteLine($"  方式         : {(dryRun ? "演练（不写文件）" : options.Mode.ToString().ToLowerInvariant())}");
-        Console.WriteLine($"  未提交谱面   : {(options.SkipUnsubmitted ? "不导入" : "导入")}");
-        Console.WriteLine($"  复用文件夹   : {(options.ReuseExistingFolders ? "是（按 set id）" : "否")}");
-        Console.WriteLine($"  校验哈希     : {(options.VerifyHashes ? "是" : "否")}");
-        Console.WriteLine();
+        Theme.WriteLine();
+        Theme.WriteLine($"{CommandLine.ToolName} {CommandLine.Version} — 迁移", Theme.AccentColor);
+        Theme.Item("lazer 数据目录", options.LazerDataDirectory + "（只读）");
+        Theme.Item("迁移内容", options.Selection.ToString());
 
-        if (!dryRun)
-        {
-            Console.WriteLine("提示：stable 里已有的文件夹只会被补齐，不会删除文件；");
-            Console.WriteLine("      内容与 lazer 不同名的同名文件默认跳过，不会覆盖。");
-            Console.WriteLine();
-        }
+        if (settings.MigrateSongs)
+            Theme.Item("谱面到", Path.Combine(stableRoot, "Songs"));
 
-        if (!PromptBool("确认执行？", true))
+        if (settings.MigrateSkins)
+            Theme.Item("皮肤到", Path.Combine(stableRoot, "Skins"));
+
+        if (settings.MigrateReplays)
+            Theme.Item("回放到", Path.Combine(stableRoot, "Replays"));
+
+        Theme.Item("方式", options.Mode == RestoreMode.HardLink ? "硬链接" : "复制");
+        Theme.Item("未提交谱面", options.SkipUnsubmitted ? "不导入" : "导入");
+        Theme.Item("复用文件夹", options.ReuseExistingFolders ? "是（按 set id）" : "否");
+        Theme.Item("校验哈希", options.VerifyHashes ? "是" : "否");
+
+        Theme.Hint("  提示：stable 里已有的文件夹只会被补齐，不会删除文件；");
+        Theme.Hint("        内容不同的同名文件默认跳过，不会覆盖。");
+
+        if (!ConsoleInput.PromptBool("确认开始迁移？", true))
         {
-            Console.WriteLine("已取消。");
+            Theme.WriteLine("已取消。");
             return;
         }
 
-        if (!dryRun && options.VerifyHashes)
-            Console.WriteLine("逐个校验源文件哈希，大约需要 1~2 分钟。");
+        if (options.VerifyHashes)
+            Theme.Hint("  逐个校验源文件哈希，可能需要 1~2 分钟；下面会显示进度。");
 
         Console.WriteLine();
 
-        int lastPercent = -1;
-
-        options = options with
-        {
-            Progress = (done, total) =>
-            {
-                if (total <= 0)
-                    return;
-
-                int percent = (int)(done * 100L / total);
-
-                if (percent == lastPercent)
-                    return;
-
-                lastPercent = percent;
-                Console.Write($"\r  进度 {percent,3}%  ({done}/{total} 文件)");
-            },
-        };
-
         var watch = System.Diagnostics.Stopwatch.StartNew();
 
-        int exitCode = Program.ExecuteRestore(
+        int exitCode = Program.ExecuteMigrate(
             options,
             Program.ResolveSchema(options.LazerDataDirectory, Array.Empty<string>()),
             Path.Combine(options.OutputDirectory, "stablerestorer-report.json"));
 
         watch.Stop();
 
-        Console.WriteLine($"\r  完成，用时 {watch.Elapsed.TotalSeconds:N1} 秒。                    ");
+        Theme.Hint($"  用时 {watch.Elapsed.TotalSeconds:N1} 秒。");
         Console.WriteLine();
 
-        if (dryRun)
-            Console.WriteLine("这是演练，没有写入任何文件。确认清单无误后，回主菜单选 3 开始真正还原。");
+        if (exitCode == 0)
+            Theme.Ok("  迁移完成，没有发现问题。建议在 stable 里按 F5 重新扫描曲库。");
+        else
+            Theme.Error($"  退出码 {exitCode}：请查看报告里的 notices 部分。");
 
-        Console.WriteLine(exitCode == 0
-            ? "没有发现问题。"
-            : $"退出码 {exitCode}：请查看报告里的 notices 部分。");
+        ConsoleInput.Pause();
     }
 
     private static bool RequirePaths(Settings settings)
@@ -453,93 +532,17 @@ public static class Wizard
         if (missing.Count == 0)
             return true;
 
-        Warn($"还没有设置：{string.Join("、", missing)}。请先选 4 修改设置。");
+        Theme.Warn($"  ! 还没有设置：{string.Join("、", missing)}。请先选 3 修改设置。");
         return false;
     }
 
-    #endregion
-
-    #region prompts
-
-    /// <summary>
-    /// Reads one line of input, removing a leading byte-order mark. Piping a UTF-8 stream into the
-    /// process (scripts, CI) can leave a BOM at the start of the first line, which would otherwise
-    /// make an otherwise valid menu choice unrecognisable.
-    /// </summary>
-    private static string? ReadLine() => Console.ReadLine()?.TrimStart('\uFEFF').TrimEnd('\r');
-
-    private static string Prompt(string label, string fallback)
+    private static bool AnySelection(Settings settings)
     {
-        Console.Write($"{label} [{fallback}]: ");
-        string? input = ReadLine();
-        return string.IsNullOrWhiteSpace(input) ? fallback : input.Trim();
-    }
+        if (settings.MigrateSongs || settings.MigrateSkins || settings.MigrateReplays)
+            return true;
 
-    private static string? PromptDirectory(string label, string? current, bool requireClientRealm)
-    {
-        while (true)
-        {
-            Console.WriteLine();
-            Console.WriteLine($"{label}");
-            Console.WriteLine($"  当前: {(string.IsNullOrWhiteSpace(current) ? "（未设置）" : current)}");
-            Console.Write("  新的路径（回车保持不变，输入 - 清空）: ");
-
-            string? input = ReadLine()?.Trim();
-
-            if (string.IsNullOrWhiteSpace(input))
-                return current;
-
-            if (input == "-")
-                return null;
-
-            input = input.Trim('"');
-
-            if (requireClientRealm && !File.Exists(Path.Combine(input, "client.realm")))
-            {
-                Warn($"这个目录里没有 client.realm：{input}");
-                continue;
-            }
-
-            if (!requireClientRealm && !Directory.Exists(input))
-            {
-                Warn($"目录不存在：{input}");
-                continue;
-            }
-
-            return input;
-        }
-    }
-
-    private static bool PromptBool(string label, bool current)
-    {
-        Console.Write($"{label} [{(current ? "Y/n" : "y/N")}]: ");
-        string? input = ReadLine()?.Trim().ToLowerInvariant();
-
-        return input switch
-        {
-            null or "" => current,
-            "y" or "yes" or "是" or "1" => true,
-            "n" or "no" or "否" or "0" => false,
-            _ => current,
-        };
-    }
-
-    private static string PromptChoice(string label, string[] choices, string current)
-    {
-        Console.Write($"{label} ({string.Join("/", choices)}) [{current}]: ");
-        string? input = ReadLine()?.Trim();
-
-        if (string.IsNullOrWhiteSpace(input))
-            return current;
-
-        foreach (string choice in choices)
-        {
-            if (choice.Equals(input, StringComparison.OrdinalIgnoreCase))
-                return choice;
-        }
-
-        Warn($"无效选择，保持 '{current}'。");
-        return current;
+        Theme.Warn("  ! 还没有选择要检查的内容，请先选 3 修改设置。");
+        return false;
     }
 
     #endregion
@@ -552,11 +555,11 @@ public static class Wizard
                 JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
 
             if (!quiet)
-                Console.WriteLine($"已写入 {SettingsPath}");
+                Theme.Hint($"已写入 {SettingsPath}");
         }
         catch (Exception ex)
         {
-            Warn($"设置无法保存到 {SettingsPath}：{ex.Message}");
+            Theme.Warn($"  ! 设置无法保存到 {SettingsPath}：{ex.Message}");
         }
     }
 
@@ -564,10 +567,6 @@ public static class Wizard
     {
         var lines = text.Split('\n');
 
-        return string.Join("\n  ", lines.Take(count).Select(l => l.TrimEnd())).Trim();
+        return string.Join("\n      ", lines.Take(count).Select(l => l.TrimEnd())).Trim();
     }
-
-    private static void Warn(string message) => Console.WriteLine($"  ! {message}");
-
-    private static void Error(string message) => Console.Error.WriteLine($"  错误: {message}");
 }
